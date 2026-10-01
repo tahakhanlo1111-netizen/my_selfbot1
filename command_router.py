@@ -23,7 +23,7 @@ _KNOWN_COMMANDS = [
     "ping", "status", "clock", "font", "quote", "اسکرین", "حذف", "تگ",
     "پنل", "بستن", "بلاک", "block", "آنبلاک", "unblock", "تاریخ",
     "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate",
-    ".", "انسیو", "سیو", "خاموش", "روشن",
+    ".", "انسیو", "سیو", "تایم", "خاموش", "روشن",
 ]
 
 
@@ -112,6 +112,8 @@ async def route(event, cmd: str, arg: str, body: str):
                     await event.edit("🔔 **آنتی‌دیلیت این چت دوباره روشن شد**")
             else:
                 await event.edit("⚠️ این دستور فقط تو PV کار می‌کنه.")
+        elif cmd == "تایم":
+            await antidelete.cmd_save_ttl(event)
         elif cmd == "سیو":
             if event.is_private:
                 antidelete.set_muted(event.chat_id, False)

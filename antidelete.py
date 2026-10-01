@@ -30,6 +30,7 @@ notifying for it so Saved Messages isn't spammed with false "edits".
 import asyncio
 import io
 import json
+import os
 from collections import OrderedDict, deque
 from datetime import datetime as _dt
 from zoneinfo import ZoneInfo
@@ -37,6 +38,7 @@ from zoneinfo import ZoneInfo
 from telethon import events
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.messages import ReadMessageContentsRequest
+from telethon.tl.types import UpdateReadMessagesContents
 
 from config import CLOCK_TIMEZONE, PREFIX
 from logger import log
@@ -135,6 +137,59 @@ def _mark_own_command(chat_id, msg_id):
 
 def _is_own_command(chat_id, msg_id) -> bool:
     return (chat_id, msg_id) in _own_command_ids
+
+
+# ── Self-destructing (timed) media ───────────────────────────────────────
+# Telegram only hands over the file once the message is "opened". Opening it
+# from this session would show the sender "opened" immediately, so by default
+# we DON'T. Instead we remember the message, and when you open it yourself
+# (on your phone/desktop) Telegram pushes UpdateReadMessagesContents to this
+# session — only then do we fetch + save it. Set TTL_AUTO_OPEN=1 to open it
+# right away instead (the old behavior), or use `.تایم` (reply) per message.
+TTL_AUTO_OPEN = os.getenv("TTL_AUTO_OPEN", "0") == "1"
+_pending_ttl: "OrderedDict[int, int]" = OrderedDict()  # msg_id -> chat_id
+_PENDING_TTL_CAP = 500
+
+
+def _is_ttl(msg) -> bool:
+    return bool(msg and msg.media and getattr(msg.media, "ttl_seconds", None))
+
+
+async def _save_ttl(client, chat_id, msg_id, unlock=False) -> bool:
+    """Fetch a timed message and post it to the inbox. unlock=True opens it
+    first (marks it opened for the sender)."""
+    try:
+        if unlock:
+            await client(ReadMessageContentsRequest(id=[msg_id]))
+        entry = None
+        for _ in range(4):
+            # Re-fetch: the message object from the original NewMessage event
+            # has no file attached — only a fresh copy after opening does.
+            msg = await client.get_messages(chat_id, ids=msg_id)
+            if msg and msg.media:
+                entry = await _build_entry(client, msg, chat_id, allow_ttl=True)
+                if entry["media_bytes"]:
+                    break
+            await asyncio.sleep(1.0)
+        if not entry or not entry["media_bytes"]:
+            log.warn(f"Anti-delete: timed media {msg_id} not downloadable (already expired?)")
+            return False
+        await _notify_with_retry(client, entry, msg_id)
+        return True
+    except Exception as e:
+        log.error(f"Anti-delete: timed media save failed for {msg_id}: {e}")
+        return False
+
+
+async def cmd_save_ttl(event):
+    """`.تایم` as a reply to a timed photo/video: open + save it on demand."""
+    reply = await event.get_reply_message()
+    if not reply or not _is_ttl(reply):
+        await event.edit("⚠️ روی یه عکس/ویدیوی تایم‌دار ریپلای کن.")
+        return
+    await event.edit("⏳ در حال باز کردن و سیو…")
+    ok = await _save_ttl(event.client, event.chat_id, reply.id, unlock=True)
+    await event.edit("✅ تایم‌دار سیو شد." if ok else "❌ نتونستم سیوش کنم (احتمالاً منقضی شده).")
 
 
 _control_bot_id = None          # resolved lazily, see _resolve_control_bot_id
@@ -242,8 +297,10 @@ def _pop(msg_id):
 
 
 async def _build_cache_entry(event):
-    msg = event.message
+    return await _build_entry(event.client, event.message, event.chat_id)
 
+
+async def _build_entry(client, msg, chat_id, allow_ttl=False):
     fwd_from_name = None
     if msg.fwd_from:
         fwd_from_name = getattr(msg.fwd_from, "from_name", None) or "منبع ناشناس"
@@ -255,36 +312,26 @@ async def _build_cache_entry(event):
     media_is_photo = False
     media_file_name = None
     if msg.media:
-        # Self-destructing ("timed") photos/videos: Telegram withholds the
-        # actual file bytes until the message is explicitly marked as
-        # opened — a deliberate server-side protection against exactly
-        # this kind of caching. messages.readMessageContents is the
-        # "I'm opening this now" signal that unlocks download access.
-        #
-        # Trade-off that can't be avoided: this DOES mark the message as
-        # read/opened for the sender, the same as if it had actually been
-        # viewed. There is no known way to retrieve the content without
-        # sending that signal.
-        ttl_seconds = getattr(msg.media, "ttl_seconds", None)
-        if ttl_seconds:
-            try:
-                await event.client(ReadMessageContentsRequest(id=[msg.id]))
-            except Exception as e:
-                log.warn(f"Anti-delete: couldn't unlock self-destruct media for msg {msg.id}: {e}")
-
+        # Self-destructing ("timed") media is NEVER opened here — opening
+        # it would show the sender "opened" before you did. It is handled
+        # separately (see _save_ttl): saved only when YOU open it, or when
+        # you run `.تایم` on it.
+        is_ttl = bool(getattr(msg.media, "ttl_seconds", None)) and not allow_ttl
         size = None
         try:
             size = msg.file.size if msg.file else None
         except Exception:
             size = None
 
-        if size is not None and size > MEDIA_MAX_BYTES:
+        if is_ttl:
+            pass  # leave media_bytes empty — never touch unopened timed media
+        elif size is not None and size > MEDIA_MAX_BYTES:
             media_too_large = True
         else:
             try:
                 buf = io.BytesIO()
                 await msg.download_media(file=buf)
-                media_bytes = buf.getvalue()
+                media_bytes = buf.getvalue() or None
                 # Re-uploading later with NO attributes/mime-type at all
                 # forces Telegram to guess the file type from scratch —
                 # in practice that usually means videos land as a generic
@@ -307,7 +354,7 @@ async def _build_cache_entry(event):
     # here, since this runs on every single private message. Names are
     # resolved later, only for the rare message that actually gets deleted.
     return {
-        "chat_id": event.chat_id,
+        "chat_id": chat_id,
         "sender_id": msg.sender_id,
         "out": bool(msg.out),
         "text": msg.raw_text or "",
@@ -319,6 +366,7 @@ async def _build_cache_entry(event):
         "media_mime_type": media_mime_type,
         "media_is_photo": media_is_photo,
         "media_file_name": media_file_name,
+        "ttl": getattr(msg.media, "ttl_seconds", None) if msg.media else None,
     }
 
 
@@ -382,6 +430,8 @@ async def _notify_to(client, dest, data):
         else "?"
     )
     header = f"👤 {sender_label}\n🕒 {date_label}"
+    if data.get("ttl"):
+        header = f"⏳ مدیای تایم‌دار\n{header}"
 
     if data["media_bytes"]:
         caption = header + (f"\n\n{data['text']}" if data["text"] else "")
@@ -584,6 +634,14 @@ def register(client):
             if event.sender_id in _excluded_bot_ids:
                 return
 
+        if not event.message.out and _is_ttl(event.message):
+            _pending_ttl[event.message.id] = event.chat_id
+            while len(_pending_ttl) > _PENDING_TTL_CAP:
+                _pending_ttl.popitem(last=False)
+            if TTL_AUTO_OPEN:
+                asyncio.create_task(_save_ttl(client, event.chat_id, event.message.id, unlock=True))
+            return
+
         # Still cache even for muted chats — bilateral-delete detection
         # needs the cache. Muting only suppresses individual notifications.
         asyncio.create_task(_cache_in_background(event))
@@ -648,6 +706,15 @@ def register(client):
         # later delete) compares against/reports the latest text, not the
         # original one.
         asyncio.create_task(_cache_in_background(event))
+
+    @client.on(events.Raw(UpdateReadMessagesContents))
+    async def _ttl_opened_handler(update):
+        if state.paused:
+            return
+        for mid in update.messages:
+            chat_id = _pending_ttl.pop(mid, None)
+            if chat_id is not None:
+                asyncio.create_task(_save_ttl(client, chat_id, mid, unlock=False))
 
     # Debounce state for bilateral deletes: Telegram fires multiple
     # MessageDeleted batches for a single "delete for everyone" — sometimes
