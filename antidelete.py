@@ -29,6 +29,7 @@ notifying for it so Saved Messages isn't spammed with false "edits".
 
 import asyncio
 import io
+import json
 from collections import OrderedDict, deque
 from datetime import datetime as _dt
 from zoneinfo import ZoneInfo
@@ -40,6 +41,7 @@ from telethon.tl.functions.messages import ReadMessageContentsRequest
 from config import CLOCK_TIMEZONE, PREFIX
 from logger import log
 import group_inbox
+import state
 
 CACHE_LIMIT_PER_CHAT = 500
 MEDIA_MAX_BYTES = 20 * 1024 * 1024  # 20MB — skip downloading bigger media
@@ -83,6 +85,16 @@ def toggle_unsave(chat_id: int) -> bool:
         _muted_chats.add(chat_id)
         _save_muted()
         return True
+
+
+def set_muted(chat_id: int, muted: bool) -> bool:
+    """Explicitly mute/unmute per-chat antidelete. Returns the new state."""
+    if muted:
+        _muted_chats.add(chat_id)
+    else:
+        _muted_chats.discard(chat_id)
+    _save_muted()
+    return muted
 
 
 _load_muted()
@@ -552,6 +564,8 @@ def register(client):
 
     @client.on(events.NewMessage())
     async def _cache_handler(event):
+        if state.paused:
+            return
         if not event.is_private:
             return
         if _my_id is not None and event.chat_id == _my_id:
@@ -576,6 +590,8 @@ def register(client):
 
     @client.on(events.MessageEdited())
     async def _edit_handler(event):
+        if state.paused:
+            return
         if not event.is_private:
             return
         if _my_id is not None and event.chat_id == _my_id:
@@ -656,6 +672,8 @@ def register(client):
 
     @client.on(events.MessageDeleted())
     async def _delete_handler(event):
+        if state.paused:
+            return
         if not event.deleted_ids:
             return
 

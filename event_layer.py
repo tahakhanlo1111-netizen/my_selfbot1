@@ -11,6 +11,7 @@ from telethon import events
 import command_router
 import fontstyle
 import message_parser
+import state
 from logger import log
 from telegram_layer import client
 
@@ -24,6 +25,8 @@ def register_handlers():
 
         parsed = message_parser.parse(text)
         if parsed is None:
+            if state.paused:
+                return
             if fontstyle.get_active():
                 styled = fontstyle.apply(text)
                 if styled != text:

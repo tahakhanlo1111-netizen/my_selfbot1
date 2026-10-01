@@ -11,6 +11,7 @@ import sys
 from telethon.errors import FloodWaitError
 
 import antidelete
+import state
 from help_text import HELP_TEXT
 from logger import log
 from plugins import ai_chat, core, downloader, media, moderation, panel, social, translate
@@ -22,7 +23,7 @@ _KNOWN_COMMANDS = [
     "ping", "status", "clock", "font", "quote", "اسکرین", "حذف", "تگ",
     "پنل", "بستن", "بلاک", "block", "آنبلاک", "unblock", "تاریخ",
     "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate",
-    ".", "انسیو", "خاموش",
+    ".", "انسیو", "سیو", "خاموش", "روشن",
 ]
 
 
@@ -46,6 +47,9 @@ def _resolve_cmd(cmd: str) -> str:
 async def route(event, cmd: str, arg: str, body: str):
     cmd = _resolve_cmd(cmd)
     try:
+        # While paused (.خاموش), everything is ignored except .روشن
+        if state.paused and cmd != "روشن":
+            return
         if cmd == "ping":
             await core.cmd_ping(event)
         elif cmd == "status":
@@ -108,15 +112,45 @@ async def route(event, cmd: str, arg: str, body: str):
                     await event.edit("🔔 **آنتی‌دیلیت این چت دوباره روشن شد**")
             else:
                 await event.edit("⚠️ این دستور فقط تو PV کار می‌کنه.")
+        elif cmd == "سیو":
+            if event.is_private:
+                antidelete.set_muted(event.chat_id, False)
+                await event.edit("🔔 **آنتی‌دیلیت این چت روشن شد**\nپیام‌های حذف/ویرایش‌شده دوباره سیو می‌شن.")
+            else:
+                await event.edit("⚠️ این دستور فقط تو PV کار می‌کنه.")
         elif cmd == "خاموش":
-            await event.edit("🔴 سلف‌بات در حال خاموش شدن…")
             import clock
             from telegram_layer import client as tg_client
-            try:
-                await clock.on_selfbot_stop(tg_client)
-            except Exception:
-                pass
-            sys.exit(0)
+            if arg == "کامل":
+                # Full process shutdown (old behavior) — can't be undone with .روشن
+                await event.edit("🔴 سلف‌بات کامل خاموش شد (برای روشن‌کردن باید سرویس رو ری‌استارت کنی)…")
+                try:
+                    await clock.on_selfbot_stop(tg_client)
+                except Exception:
+                    pass
+                sys.exit(0)
+            state.paused = True
+            state.clock_was_on = clock.clock_active
+            if clock.clock_active:
+                try:
+                    await clock.stop_clock(tg_client)
+                except Exception:
+                    pass
+            await event.edit("🔴 سلف‌بات خاموش شد (فقط `.روشن` کار می‌کنه).")
+        elif cmd == "روشن":
+            if not state.paused:
+                await event.edit("🟢 سلف‌بات از قبل روشن بود.")
+            else:
+                state.paused = False
+                if state.clock_was_on:
+                    import clock
+                    from telegram_layer import client as tg_client
+                    try:
+                        await clock.start_clock(tg_client)
+                    except Exception:
+                        pass
+                state.clock_was_on = False
+                await event.edit("🟢 سلف‌بات دوباره روشن شد.")
         # Nothing else matches → silently ignored
 
     except FloodWaitError as e:
