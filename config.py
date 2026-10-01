@@ -54,10 +54,10 @@ OPENROUTER_FALLBACK_MODELS = [
 # Client-side rate limit on OpenRouter calls. 0 = unlimited.
 OPENROUTER_MAX_CALLS_PER_MINUTE = _get("OPENROUTER_MAX_CALLS_PER_MINUTE", default=0, cast=int)
 
-# Comma-separated bot usernames whose messages antidelete should ignore
-# (neither cache nor report). Set this to your own control bot's username
-# and any other bots you don't want tracked.
-# Example: ANTIDELETE_EXCLUDE_BOTS=mycontrolbot,anotherbot
+# Comma-separated bot usernames OR numeric user IDs that antidelete should
+# ignore entirely (neither cache nor report deleted/edited messages).
+# Supports both formats, mixed freely:
+#   ANTIDELETE_EXCLUDE_BOTS=mycontrolbot,123456789,anotherbot
 ANTIDELETE_EXCLUDE_BOTS: set = {
     u.strip() for u in _get("ANTIDELETE_EXCLUDE_BOTS", default="").split(",") if u.strip()
 }

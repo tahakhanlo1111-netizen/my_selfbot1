@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 from telethon import events
 from telethon.errors import FloodWaitError
+from telethon.tl.functions.messages import ReadMessageContentsRequest
 
 from config import CLOCK_TIMEZONE, PREFIX
 from logger import log
@@ -47,6 +48,44 @@ NOTIFY_DELAY = 1.0  # seconds between forwarded notifications — a bulk
                      # delete of hundreds of messages at once would
                      # otherwise blast Saved Messages and hit FloodWait
 NOTIFY_MAX_RETRIES = 3
+
+# Per-chat antidelete mute — chats where .انسیو was run.
+# Individual deletions/edits are NOT reported, but bilateral deletions are
+# always saved (regardless of mute state). Persisted across restarts.
+_MUTED_FILE = "antidelete_muted.json"
+_muted_chats: set = set()
+
+
+def _load_muted():
+    global _muted_chats
+    try:
+        with open(_MUTED_FILE, "r", encoding="utf-8") as f:
+            _muted_chats = set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        _muted_chats = set()
+
+
+def _save_muted():
+    try:
+        with open(_MUTED_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(_muted_chats), f)
+    except Exception as e:
+        log.warn(f"antidelete: couldn't save muted chats: {e}")
+
+
+def toggle_unsave(chat_id: int) -> bool:
+    """Toggle per-chat antidelete mute. Returns True if now muted, False if unmuted."""
+    if chat_id in _muted_chats:
+        _muted_chats.discard(chat_id)
+        _save_muted()
+        return False
+    else:
+        _muted_chats.add(chat_id)
+        _save_muted()
+        return True
+
+
+_load_muted()
 
 _chat_caches = {}       # chat_id -> {msg_id: entry}
 _chat_cache_order = {}  # chat_id -> deque([msg_id, ...]) oldest-left
@@ -93,8 +132,16 @@ _control_bot_id_attempted = False
 # Set via ANTIDELETE_EXCLUDE_BOTS env var (comma-separated usernames),
 # e.g. ANTIDELETE_EXCLUDE_BOTS=mybotname,anotherbot
 # Nothing is hardcoded here — this file must not contain personal info.
-from config import ANTIDELETE_EXCLUDE_BOTS as _EXTRA_EXCLUDE_USERNAMES
+from config import ANTIDELETE_EXCLUDE_BOTS as _EXTRA_EXCLUDE_RAW
+
+# Split into numeric IDs (added directly) and usernames (resolved lazily)
+_EXTRA_EXCLUDE_USERNAMES: set = set()
 _excluded_bot_ids: set = set()
+for _entry in _EXTRA_EXCLUDE_RAW:
+    if _entry.lstrip("-").isdigit():
+        _excluded_bot_ids.add(int(_entry))   # numeric ID — no resolve needed
+    else:
+        _EXTRA_EXCLUDE_USERNAMES.add(_entry) # username — resolved on first message
 _excluded_resolved = False
 
 
@@ -196,6 +243,23 @@ async def _build_cache_entry(event):
     media_is_photo = False
     media_file_name = None
     if msg.media:
+        # Self-destructing ("timed") photos/videos: Telegram withholds the
+        # actual file bytes until the message is explicitly marked as
+        # opened — a deliberate server-side protection against exactly
+        # this kind of caching. messages.readMessageContents is the
+        # "I'm opening this now" signal that unlocks download access.
+        #
+        # Trade-off that can't be avoided: this DOES mark the message as
+        # read/opened for the sender, the same as if it had actually been
+        # viewed. There is no known way to retrieve the content without
+        # sending that signal.
+        ttl_seconds = getattr(msg.media, "ttl_seconds", None)
+        if ttl_seconds:
+            try:
+                await event.client(ReadMessageContentsRequest(id=[msg.id]))
+            except Exception as e:
+                log.warn(f"Anti-delete: couldn't unlock self-destruct media for msg {msg.id}: {e}")
+
         size = None
         try:
             size = msg.file.size if msg.file else None
@@ -490,17 +554,9 @@ def register(client):
     async def _cache_handler(event):
         if not event.is_private:
             return
-        # Skip Saved Messages (chat_id == own user id) — deleting there is
-        # deliberate housekeeping, not something worth saving.
         if _my_id is not None and event.chat_id == _my_id:
             return
         if event.message.out and (event.message.raw_text or "").startswith(PREFIX):
-            # This is you sending a `.command` — the selfbot is about to
-            # edit this very message in place as its reply (and possibly
-            # re-edit it several times, e.g. a delete-progress counter).
-            # None of that is conversation worth a cache slot, so skip
-            # caching it from the start and remember its id so every
-            # future edit skips too.
             _mark_own_command(event.chat_id, event.message.id)
             return
 
@@ -509,19 +565,13 @@ def register(client):
                 await _resolve_control_bot_id()
             if _control_bot_id is not None and event.sender_id == _control_bot_id:
                 return
-
             if not _excluded_resolved:
                 await _resolve_excluded_bots(client)
             if event.sender_id in _excluded_bot_ids:
-                # e.g. @TMKselfbot — its messages are bot-generated UI
-                # chatter, not real conversation worth caching or reporting.
                 return
 
-        # Building the cache entry can involve downloading media, which is
-        # network-bound and was previously awaited right here — meaning
-        # every private photo/video briefly stalled this handler before it
-        # could return. Fire it off as a background task instead so the
-        # handler itself is instant regardless of media size/network speed.
+        # Still cache even for muted chats — bilateral-delete detection
+        # needs the cache. Muting only suppresses individual notifications.
         asyncio.create_task(_cache_in_background(event))
 
     @client.on(events.MessageEdited())
@@ -548,13 +598,16 @@ def register(client):
 
         if not _control_bot_id_attempted:
             await _resolve_control_bot_id()
-
         if _control_bot_id is not None and event.sender_id == _control_bot_id:
             return
-
         if not _excluded_resolved:
             await _resolve_excluded_bots(client)
         if event.sender_id in _excluded_bot_ids:
+            return
+
+        # Muted chat — refresh cache but don't notify about edits
+        if event.chat_id in _muted_chats:
+            asyncio.create_task(_cache_in_background(event))
             return
 
         cache = _chat_caches.get(chat_id)
@@ -657,7 +710,13 @@ def register(client):
         if own_hits and not other_hits:
             return  # You deleted your own message — nothing to report.
 
+        # Individual deletions by the other person
         for msg_id, data in other_hits:
+            # Skip notification if this chat is muted (.انسیو was run here).
+            # Bilateral deletes (own_hits AND other_hits) always bypass this
+            # check above, so the conversation is always saved even when muted.
+            if data.get("chat_id") in _muted_chats:
+                continue
             await _notify_with_retry(client, data, msg_id)
             await asyncio.sleep(NOTIFY_DELAY)
 

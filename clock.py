@@ -99,18 +99,31 @@ async def stop_clock(client) -> bool:
 
 
 async def on_selfbot_start(client):
-    """Call once when the selfbot process starts — always turns the clock
-    ON, regardless of whether it was on before."""
+    """Call once when the selfbot process starts.
+    Previously always turned the clock ON — now it only resumes if the
+    clock was ON when the process last stopped. This lets users keep the
+    clock OFF across restarts without having to turn it off every time."""
     global clock_active, _task
+
+    # Read the last-saved state; default to OFF (False) if no file exists
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        was_on = bool(saved.get("active", False))
+    except (FileNotFoundError, json.JSONDecodeError):
+        was_on = False
+
+    if not was_on:
+        log.ok("Clock is OFF (saved state) — start it manually with .clock on")
+        return
 
     clock_active = True
     _save_state()
 
     now = datetime.now(ZoneInfo(CLOCK_TIMEZONE)).strftime("%H:%M")
     first_ok = await _set_last_name(client, now)
-
     _task = asyncio.create_task(_clock_loop(client, initial_last_time=now if first_ok else None))
-    log.ok("Clock turned ON (auto, selfbot startup)" if first_ok else "Clock turned ON (auto) — first update rate limited, will retry")
+    log.ok("Clock resumed ON (saved state)" if first_ok else "Clock resumed ON — first update rate limited, will retry")
 
 
 async def on_selfbot_stop(client):

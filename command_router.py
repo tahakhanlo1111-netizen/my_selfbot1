@@ -6,9 +6,11 @@ message is silently ignored (same as a `.` typo in normal chat always did).
 """
 
 import difflib
+import sys
 
 from telethon.errors import FloodWaitError
 
+import antidelete
 from help_text import HELP_TEXT
 from logger import log
 from plugins import ai_chat, core, downloader, media, moderation, panel, social, translate
@@ -19,7 +21,8 @@ from plugins import ai_chat, core, downloader, media, moderation, panel, social,
 _KNOWN_COMMANDS = [
     "ping", "status", "clock", "font", "quote", "اسکرین", "حذف", "تگ",
     "پنل", "بستن", "بلاک", "block", "آنبلاک", "unblock", "تاریخ",
-    "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate", ".",
+    "help", "راهنما", "ai", "ایدی", "id", "ترجمه", "translate",
+    ".", "انسیو", "خاموش",
 ]
 
 
@@ -92,7 +95,29 @@ async def route(event, cmd: str, arg: str, body: str):
             await translate.cmd_translate(event, lang_word, text_body)
         elif cmd == ".":
             await downloader.cmd_download_video(event)
-        # Nothing else matches -> ignored on purpose
+        elif cmd == "انسیو":
+            if event.is_private:
+                muted = antidelete.toggle_unsave(event.chat_id)
+                if muted:
+                    await event.edit(
+                        "🔕 **آنتی‌دیلیت این چت خاموش شد**\n"
+                        "پیام‌های حذف/ویرایش‌شده دیگه سیو نمی‌شن.\n"
+                        "_دیلیت دوطرفه همیشه سیو می‌شه._"
+                    )
+                else:
+                    await event.edit("🔔 **آنتی‌دیلیت این چت دوباره روشن شد**")
+            else:
+                await event.edit("⚠️ این دستور فقط تو PV کار می‌کنه.")
+        elif cmd == "خاموش":
+            await event.edit("🔴 سلف‌بات در حال خاموش شدن…")
+            import clock
+            from telegram_layer import client as tg_client
+            try:
+                await clock.on_selfbot_stop(tg_client)
+            except Exception:
+                pass
+            sys.exit(0)
+        # Nothing else matches → silently ignored
 
     except FloodWaitError as e:
         log.warn(f"Rate limited, wait {e.seconds}s")
